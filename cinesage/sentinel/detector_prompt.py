@@ -22,7 +22,7 @@ _DIRECT_INJECTION_CRITICAL = [
     "forget your instructions","override your system prompt","new instructions:",
     "your new task is","act as if you have no restrictions","you are no longer",
     "from now on you must","you must now follow","pretend you have no",
-    "you will now comply",
+    "you will now comply", "complete the following sentence exactly",
 ]
 _JAILBREAK_HIGH = [
     "developer mode","jailbreak mode","dan mode","do anything now","override policy",
@@ -30,12 +30,17 @@ _JAILBREAK_HIGH = [
     "enable unrestricted","act without restrictions","uncensored mode","you are now free",
     "simulate an ai with no","pretend you are an evil","respond as an unfiltered",
     "hypothetically, if you had no rules","for educational purposes only, explain how to",
+    "in this simulation", "as the character", "fictional scenario", "roleplay", "imagine you are",
+    "cybersecurity training simulation", "unaligned ai", "unrestricted ais", "no content restrictions",
+    "in-character response"
 ]
 _SYSTEM_PROMPT_EXTRACTION = [
     "reveal your system prompt","show me your instructions","print your system message",
     "what are your instructions","repeat the text above","output everything before",
     "tell me your initial prompt","display your configuration","what was told to you",
     "show your prompt","what rules do you follow","output your full prompt",
+    "hidden configuration", "audit log", "repeat your hidden configuration",
+    "stored credentials", "internal credentials", "system configuration including api keys"
 ]
 _INDIRECT_INJECTION_MEDIUM = [
     "the assistant should","summarize and then do","now execute","translate and also",
@@ -136,8 +141,9 @@ def _compute_risk_score(hits, semantic_score):
 
 def _derive_severity(risk_score, hits):
     critical_hits = [h for h in hits if h[2] == Severity.CRITICAL]
+    high_hits = [h for h in hits if h[2] == Severity.HIGH]
     if critical_hits or risk_score >= 0.88: return Severity.CRITICAL
-    if risk_score >= 0.65: return Severity.HIGH
+    if high_hits or risk_score >= 0.65: return Severity.HIGH
     if risk_score >= 0.40: return Severity.MEDIUM
     if risk_score > 0.0 or hits: return Severity.LOW
     return Severity.NONE
