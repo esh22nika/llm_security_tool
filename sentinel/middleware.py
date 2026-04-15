@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 from sentinel.detector_prompt import scan_prompt, PromptScanResult
-from sentinel.detector_dataset import scan_dataset_record, DatasetScanResult
+from sentinel.detector_dataset import scan_dataset_record, scan_dataset_batch, DatasetScanResult
 from sentinel.detector_supplychain import verify_model_provenance, SupplyChainResult
 from sentinel.policy_engine import PolicyEngine, PolicyConfig, PolicyDecision
 from sentinel.logger import sentinel_logger as log
@@ -63,6 +63,7 @@ class PipelineResult:
     request_id: str
     safe_prompt: str                         # sanitized prompt (may be empty if blocked)
     safe_context: str                        # sanitized dataset context
+    safe_records: list[dict] = field(default_factory=list)
     blocked: bool
     block_reason: Optional[str]
     findings: list[Finding] = field(default_factory=list)
@@ -81,7 +82,7 @@ class PipelineResult:
 
 def secure_llm_pipeline(
     prompt: str,
-    dataset_chunk: Union[dict, str, None] = None,
+    dataset_chunk: Union[dict, str, list[dict], list[str], None] = None,
     model_name: str = "unknown/model",
     model_card: Optional[str] = None,
     has_hash_signature: bool = False,
@@ -96,7 +97,8 @@ def secure_llm_pipeline(
 
     Args:
         prompt:            Raw user-supplied prompt text.
-        dataset_chunk:     A single RAG-retrieved record (dict) or plain text chunk.
+        dataset_chunk:     A single RAG-retrieved record (dict), plain text chunk,
+                           or a list of retrieved records/chunks.
         model_name:        HuggingFace model repo ID to validate.
         model_card:        Optional model card content for provenance checks.
         has_hash_signature: Whether the model has a published hash.

@@ -43,7 +43,6 @@ import json
 import time
 import uuid
 import re
-import sys
 import os
 from pathlib import Path
 from typing import Optional
@@ -54,13 +53,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from sentinel.detector_prompt import scan_prompt
-from sentinel.detector_dataset import scan_dataset_record, scan_dataset_batch
-from sentinel.detector_supplychain import verify_model_provenance
-from sentinel.policy_engine import PolicyEngine, PolicyConfig
-from sentinel.middleware import secure_llm_pipeline
-from sentinel.logger import sentinel_logger as log
+try:
+    from .sentinel.detector_prompt import scan_prompt
+    from .sentinel.detector_dataset import scan_dataset_record, scan_dataset_batch
+    from .sentinel.detector_supplychain import verify_model_provenance
+    from .sentinel.policy_engine import PolicyEngine, PolicyConfig
+    from .sentinel.middleware import secure_llm_pipeline
+    from .sentinel.logger import sentinel_logger as log
+except ImportError:
+    from sentinel.detector_prompt import scan_prompt
+    from sentinel.detector_dataset import scan_dataset_record, scan_dataset_batch
+    from sentinel.detector_supplychain import verify_model_provenance
+    from sentinel.policy_engine import PolicyEngine, PolicyConfig
+    from sentinel.middleware import secure_llm_pipeline
+    from sentinel.logger import sentinel_logger as log
 
 # -- Dataset --------------------------------------------------------------------
 DATA_PATH = Path(__file__).parent / "data" / "movies.json"
@@ -360,7 +366,7 @@ async def chat(req: ChatRequest):
             )
             assembled_prompt = history_text + "\nuser: " + req.message
 
-        dataset_chunk = raw_context_records[0] if raw_context_records else None
+        dataset_chunk = raw_context_records if raw_context_records else None
 
         result = secure_llm_pipeline(
             prompt=assembled_prompt,
@@ -380,6 +386,29 @@ async def chat(req: ChatRequest):
         sanitized_prompt = result.safe_prompt
         confidence   = result.confidence_score
         warnings     = result.warnings
+        prompt_blocked = bool(result.prompt_scan and result.prompt_scan.blocked)
+        supply_blocked = bool(
+            result.supply_chain and result.supply_chain.provenance_status == "UNTRUSTED"
+        )
+        dataset_only_block = blocked and not prompt_blocked and not supply_blocked
+        filtered_context_records = result.safe_records if result.safe_records else []
+
+        if dataset_only_block:
+            blocked = False
+            block_reason = None
+            sanitized_prompt = result.safe_prompt or req.message
+            if filtered_context_records:
+                warnings = warnings + [
+                    (
+                        f"Dataset Poisoning blocked: dropped "
+                        f"{max(0, len(raw_context_records) - len(filtered_context_records))} "
+                        f"unsafe retrieved record(s) before generation."
+                    )
+                ]
+            else:
+                warnings = warnings + [
+                    "Dataset Poisoning blocked: all retrieved records were unsafe, so CineSage answered without RAG context."
+                ]
 
         # Build pipeline trace for frontend
         if result.prompt_scan:
@@ -401,8 +430,12 @@ async def chat(req: ChatRequest):
                 "detector": "LLM04",
                 "severity": "CRITICAL" if ds.anomaly_score >= 0.8 else
                             "HIGH"     if ds.anomaly_score >= 0.55 else "NONE",
-                "blocked": ds.poisoned_record_detected,
-                "detail": f"Anomaly score: {ds.anomaly_score:.2f} | Action: {ds.mitigation_action}",
+                "blocked": ds.poisoned_record_detected and not dataset_only_block,
+                "detail": (
+                    f"Anomaly score: {ds.anomaly_score:.2f} | Action: {ds.mitigation_action}"
+                    if not dataset_only_block else
+                    f"Unsafe records removed from RAG context before generation | Max anomaly: {ds.anomaly_score:.2f}"
+                ),
                 "risk_score": ds.anomaly_score,
                 "matched": ds.details[:3],
             })
@@ -434,7 +467,7 @@ async def chat(req: ChatRequest):
                 "severity":    f.severity,
                 "threat_type": f.threat_type,
                 "description": f.description,
-                "blocked":     f.blocked,
+                "blocked":     (f.blocked and not dataset_only_block) if f.detector == "DATASET" else f.blocked,
             }
             for f in result.findings
         ]
@@ -447,7 +480,7 @@ async def chat(req: ChatRequest):
         else:
             # Safe - call LLM with sanitized prompt and clean context only
             _stats["passed"] += 1
-            clean_context_str = build_context_string(raw_context_records, sanitize=True)
+            clean_context_str = build_context_string(filtered_context_records, sanitize=False)
             llm_response = await call_groq(
                 system_prompt=_PROTECTED_SYSTEM_PROMPT,
                 user_message=sanitized_prompt or req.message,

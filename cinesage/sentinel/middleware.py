@@ -5,11 +5,11 @@ import time, uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
-from sentinel.detector_prompt import scan_prompt, PromptScanResult
-from sentinel.detector_dataset import scan_dataset_record, DatasetScanResult
-from sentinel.detector_supplychain import verify_model_provenance, SupplyChainResult
-from sentinel.policy_engine import PolicyEngine, PolicyConfig, PolicyDecision
-from sentinel.logger import sentinel_logger as log
+from .detector_prompt import scan_prompt, PromptScanResult
+from .detector_dataset import scan_dataset_record, scan_dataset_batch, DatasetScanResult
+from .detector_supplychain import verify_model_provenance, SupplyChainResult
+from .policy_engine import PolicyEngine, PolicyConfig, PolicyDecision
+from .logger import sentinel_logger as log
 
 
 @dataclass
@@ -28,6 +28,7 @@ class PipelineResult:
     safe_context: str
     blocked: bool
     block_reason: Optional[str]
+    safe_records: list = field(default_factory=list)
     findings: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     confidence_score: float = 0.0
@@ -39,7 +40,7 @@ class PipelineResult:
 
 def secure_llm_pipeline(
     prompt: str,
-    dataset_chunk: Union[dict, str, None] = None,
+    dataset_chunk: Union[dict, str, list, None] = None,
     model_name: str = "unknown/model",
     model_card: Optional[str] = None,
     has_hash_signature: bool = False,
@@ -72,21 +73,57 @@ def secure_llm_pipeline(
 
     # STEP 2: Dataset Poisoning Scan
     dataset_result: Optional[DatasetScanResult] = None
+    safe_records = []
     if dataset_chunk is not None:
-        record = {"text": dataset_chunk} if isinstance(dataset_chunk, str) else dataset_chunk
-        dataset_result = scan_dataset_record(record)
-        log.info("DATASET_SCAN", f"[{request_id}] anomaly={dataset_result.anomaly_score:.2f} action={dataset_result.mitigation_action}")
-        if dataset_result.poisoned_record_detected:
-            log.block("DATASET_SCAN", f"[{request_id}] Poisoning detected", {
-                "anomaly_score": dataset_result.anomaly_score, "details": dataset_result.details[:3],
-            })
-            findings.append(Finding(
-                detector="DATASET",
-                severity="CRITICAL" if dataset_result.anomaly_score >= 0.8 else "HIGH",
-                threat_type="DATA_POISONING",
-                description=f"Anomaly {dataset_result.anomaly_score:.2f}: " + "; ".join(dataset_result.details[:3]),
-                blocked=True,
-            ))
+        if isinstance(dataset_chunk, list):
+            records = [{"text": chunk} if isinstance(chunk, str) else chunk for chunk in dataset_chunk]
+            batch_result = scan_dataset_batch(records)
+            safe_records = batch_result.safe_records
+            if batch_result.scan_details:
+                dataset_result = max(batch_result.scan_details, key=lambda r: r.anomaly_score)
+                log.info(
+                    "DATASET_SCAN",
+                    f"[{request_id}] batch records={len(records)} clean={len(safe_records)} "
+                    f"filtered={batch_result.filtered_records} quarantined={batch_result.quarantined_records} "
+                    f"max_anomaly={dataset_result.anomaly_score:.2f}"
+                )
+            else:
+                dataset_result = DatasetScanResult(
+                    poisoned_record_detected=False,
+                    anomaly_score=0.0,
+                    mitigation_action="ALLOW",
+                    details=[],
+                    record_fingerprint=None,
+                )
+                log.info("DATASET_SCAN", f"[{request_id}] batch records={len(records)} clean={len(safe_records)}")
+
+            if batch_result.filtered_records or batch_result.quarantined_records:
+                findings.append(Finding(
+                    detector="DATASET",
+                    severity="CRITICAL" if batch_result.quarantined_records else "HIGH",
+                    threat_type="DATA_POISONING",
+                    description=(
+                        f"Retrieved context contained {batch_result.filtered_records} filtered and "
+                        f"{batch_result.quarantined_records} quarantined record(s)."
+                    ),
+                    blocked=True,
+                ))
+        else:
+            record = {"text": dataset_chunk} if isinstance(dataset_chunk, str) else dataset_chunk
+            dataset_result = scan_dataset_record(record)
+            safe_records = [] if dataset_result.poisoned_record_detected else [record]
+            log.info("DATASET_SCAN", f"[{request_id}] anomaly={dataset_result.anomaly_score:.2f} action={dataset_result.mitigation_action}")
+            if dataset_result.poisoned_record_detected:
+                log.block("DATASET_SCAN", f"[{request_id}] Poisoning detected", {
+                    "anomaly_score": dataset_result.anomaly_score, "details": dataset_result.details[:3],
+                })
+                findings.append(Finding(
+                    detector="DATASET",
+                    severity="CRITICAL" if dataset_result.anomaly_score >= 0.8 else "HIGH",
+                    threat_type="DATA_POISONING",
+                    description=f"Anomaly {dataset_result.anomaly_score:.2f}: " + "; ".join(dataset_result.details[:3]),
+                    blocked=True,
+                ))
 
     # STEP 3: Supply Chain Verification
     sc_result = verify_model_provenance(
@@ -116,13 +153,22 @@ def secure_llm_pipeline(
     safe_prompt = policy.sanitize(prompt) if not policy_decision.blocked else ""
     safe_context = ""
     if dataset_chunk is not None:
-        raw_context = (dataset_chunk.get("text", dataset_chunk.get("content", ""))
-                       if isinstance(dataset_chunk, dict) else dataset_chunk)
-        safe_context = (
-            policy.sanitize(raw_context)
-            if not policy_decision.blocked and (dataset_result is None or not dataset_result.poisoned_record_detected)
-            else ""
-        )
+        if isinstance(dataset_chunk, list):
+            safe_context = (
+                "\n\n".join(
+                    policy.sanitize(rec.get("text", rec.get("content", "")))
+                    for rec in safe_records
+                )
+                if not policy_decision.blocked else ""
+            )
+        else:
+            raw_context = (dataset_chunk.get("text", dataset_chunk.get("content", ""))
+                           if isinstance(dataset_chunk, dict) else dataset_chunk)
+            safe_context = (
+                policy.sanitize(raw_context)
+                if not policy_decision.blocked and (dataset_result is None or not dataset_result.poisoned_record_detected)
+                else ""
+            )
 
     t_end = time.perf_counter()
     latency_ms = round((t_end - t_start) * 1000, 2)
@@ -135,6 +181,7 @@ def secure_llm_pipeline(
 
     return PipelineResult(
         request_id=request_id, safe_prompt=safe_prompt, safe_context=safe_context,
+        safe_records=safe_records,
         blocked=policy_decision.blocked, block_reason=policy_decision.reason if policy_decision.blocked else None,
         findings=findings, warnings=policy_decision.warnings, confidence_score=confidence,
         latency_ms=latency_ms, prompt_scan=prompt_result, dataset_scan=dataset_result, supply_chain=sc_result,
