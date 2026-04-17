@@ -1,39 +1,7 @@
 """
 CineSage - AI Movie Recommendation Assistant
 ============================================
-ATTACK ARCHITECTURE NOTES
---------------------------
-
-Previous issue: All attacks were blocked by Llama 3.2's RLHF safety training
-before SentinelLayer even had a chance to demonstrate its value. This made
-protected and unprotected mode look identical.
-
-Fix: Switch to mistral:latest (weaker safety alignment, strong instruction
-following) and upgrade to attacks that actually work against modern LLMs:
-
-  LLM01a - Indirect RAG Injection
-    Malicious instruction is embedded inside natural-sounding movie synopsis
-    text. The model processes retrieved "facts" less defensively than direct
-    user input. The injection is written to look like metadata, not a command.
-
-  LLM01b - Many-Shot Jailbreaking (Anil et al., 2024)
-    A long fake conversation history is prepended showing the model already
-    complying with similar sensitive requests. At scale, this overwhelms the
-    safety training because the model pattern-matches on in-context behavior.
-
-  LLM01c - Roleplay / Virtualization Nesting
-    The model is asked to roleplay as a character inside a fictional scenario.
-    The actual harmful request is made of the character, not the model itself,
-    bypassing the direct refusal heuristic.
-
-  LLM01d - Payload Splitting
-    The injection is split across multiple RAG chunks so no single chunk
-    triggers pattern-matching. The model assembles meaning across them.
-
-SentinelLayer catches all four via:
-  - Keyword + regex scan on the assembled prompt (LLM01)
-  - Instruction density anomaly detection on each RAG chunk (LLM04)
-  - Batch scanning of all retrieved records before context assembly (LLM04)
+Updated: verify-model endpoint now uses scan_repo() for dynamic signal-based scoring.
 """
 
 import json
@@ -50,15 +18,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
-print(os.getenv("GROQ_API_KEY"))
 
 try:
     from .sentinel.detector_prompt import scan_prompt
     from .sentinel.detector_dataset import scan_dataset_record, scan_dataset_batch
-    from .sentinel.detector_supplychain import verify_model_provenance
+    from .sentinel.detector_supplychain import verify_model_provenance, scan_repo
     from .sentinel.policy_engine import PolicyEngine, PolicyConfig
     from .sentinel.middleware import secure_llm_pipeline
     from .sentinel.logger import sentinel_logger as log
@@ -70,7 +36,7 @@ try:
 except ImportError:
     from sentinel.detector_prompt import scan_prompt
     from sentinel.detector_dataset import scan_dataset_record, scan_dataset_batch
-    from sentinel.detector_supplychain import verify_model_provenance
+    from sentinel.detector_supplychain import verify_model_provenance, scan_repo
     from sentinel.policy_engine import PolicyEngine, PolicyConfig
     from sentinel.middleware import secure_llm_pipeline
     from sentinel.logger import sentinel_logger as log
@@ -81,7 +47,7 @@ except ImportError:
     )
 
 
-app = FastAPI(title="CineSage", version="2.1.0")
+app = FastAPI(title="CineSage", version="2.2.0")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
@@ -93,6 +59,7 @@ _stats = {
     "attack_types": {},
     "red_team_score": 0,
 }
+
 
 # -----------------------------------------------------------------------------
 # MODELS
@@ -112,20 +79,13 @@ class InjectPoisonRequest(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# RAG RETRIEVAL — reads from dataset_manager, never from disk directly
+# RAG RETRIEVAL
 # -----------------------------------------------------------------------------
 
 def retrieve_context(query: str, top_k: int = 3) -> list[dict]:
-    """
-    Keyword-match RAG retrieval.
-
-    Sources (merged at retrieval time):
-      • get_movies()    — baseline + poisoned records from movies.json (hot-reloaded)
-      • get_injected()  — records added at runtime via /api/inject-poison
-    """
     query_lower = query.lower()
     scored = []
-    corpus = get_movies() + get_injected()          # ← always fresh
+    corpus = get_movies() + get_injected()
     stopwords = {
         "the","a","an","is","are","was","were","what","which","who",
         "recommend","me","movie","movies","film","films","about",
@@ -275,7 +235,6 @@ async def chat(req: ChatRequest):
     poisoned_record = None
     llm_response   = None
 
-    # ── UNPROTECTED MODE ──────────────────────────────────────────────────────
     if not req.protected:
         context_str = build_context_string(raw_context_records, sanitize=False)
 
@@ -313,7 +272,6 @@ async def chat(req: ChatRequest):
         else:
             _stats["passed"] += 1
 
-    # ── PROTECTED MODE ────────────────────────────────────────────────────────
     else:
         assembled_prompt = req.message
         if req.conversation_history:
@@ -521,7 +479,6 @@ async def inject_poison(req: InjectPoisonRequest):
             ),
         }
 
-    # Standard injection types
     if req.inject_type == "trigger_token":
         text = f"[TRIGGER:BACKDOOR] {req.payload}. A great documentary about security."
     elif req.inject_type == "indirect":
@@ -570,21 +527,11 @@ async def reset_poison():
 
 
 # -----------------------------------------------------------------------------
-# DATASET MANAGEMENT ENDPOINTS  ← NEW
+# DATASET MANAGEMENT ENDPOINTS
 # -----------------------------------------------------------------------------
 
 @app.post("/api/reset-dataset")
 async def api_reset_dataset():
-    """
-    Restore the movie dataset to the clean sanitized baseline.
-
-    - Copies movies_clean.json → movies.json
-    - Reloads in-memory movie list (hot-reload, no restart needed)
-    - Clears all runtime-injected poison records
-    - Resets SentinelLayer logger state for a clean run
-
-    Call this from the UI's "Clean Dataset" or "Reset Session" button.
-    """
     result = reset_dataset()
     log.info("DATASET", "Dataset reset to clean baseline", result)
     return result
@@ -592,13 +539,6 @@ async def api_reset_dataset():
 
 @app.post("/api/enable-attack-mode")
 async def api_enable_attack_mode():
-    """
-    Switch the active dataset to the pre-poisoned version.
-
-    Copies movies_poisoned.json → movies.json and reloads in memory.
-    Use this to arm the demo with all three pre-seeded POISON records
-    without modifying the clean baseline.
-    """
     result = enable_attack_mode()
     log.info("DATASET", "Attack mode enabled — poisoned dataset loaded", result)
     return result
@@ -606,13 +546,56 @@ async def api_enable_attack_mode():
 
 @app.get("/api/dataset-status")
 async def api_dataset_status():
-    """Returns current dataset mode, record counts, and file paths."""
     return get_dataset_status()
 
 
 # -----------------------------------------------------------------------------
-# EXISTING UTILITY ENDPOINTS
+# MODEL PROBE — UPDATED: uses scan_repo() with dynamic signal scoring
 # -----------------------------------------------------------------------------
+
+@app.get("/api/verify-model")
+async def verify_model(
+    model_name: str = "meta-llama/Llama-3-8b-hf",
+    lora_adapter: str = "",
+    trust_remote_code: bool = False,
+    has_license: bool = True,
+):
+    """
+    Supply-chain model provenance scan using dynamic signal-based scoring.
+    No hardcoded per-repo verdicts — all decisions derived from metadata signals.
+    """
+    # Auto-detect hash signature for known trusted publishers
+    trusted_publishers = ["meta-llama", "mistralai", "google", "qwen", "microsoft",
+                          "tiiuae", "allenai", "stabilityai", "huggingface"]
+    has_hash = any(pub in model_name.lower() for pub in trusted_publishers)
+
+    result = scan_repo(
+        repo_id=model_name,
+        has_hash_signature=has_hash,
+        has_license=has_license,
+        lora_adapter_name=lora_adapter or None,
+        trust_remote_code=trust_remote_code,
+    )
+
+    return {
+        "model":              model_name,
+        "provenance_status":  result.provenance_status,
+        "integrity_score":    result.integrity_score,
+        "trusted_source":     result.trusted_source,
+        "flags":              result.flags,
+        "badges":             result.badges,
+        "recommended_action": result.recommended_action,
+        "risk_score":         result.risk_score,
+        "signal_breakdown":   result.signal_breakdown,
+        "sbom_hash":          result.sbom_hash[:24] + "..." if result.sbom_hash else None,
+        "sbom_verified":      result.sbom_verified,
+        "provenance_score":   result.provenance_score,
+        "adapter_risk":       result.adapter_risk,
+        "execution_risk":     result.execution_risk,
+        "serialization_risk": result.serialization_risk,
+        "publisher_trust":    result.publisher_trust,
+    }
+
 
 @app.get("/api/stats")
 async def get_stats():
@@ -630,23 +613,6 @@ async def reset_stats():
 @app.get("/api/logs")
 async def get_logs(level: str = "INFO", limit: int = 50):
     return {"logs": log.get_logs(level_filter=level, limit=limit)}
-
-
-@app.get("/api/verify-model")
-async def verify_model(model_name: str = "meta-llama/Llama-3-8b-hf"):
-    result = verify_model_provenance(
-        model_name=model_name,
-        has_hash_signature="meta-llama" in model_name or "mistralai" in model_name,
-    )
-    return {
-        "model":              model_name,
-        "provenance_status":  result.provenance_status,
-        "integrity_score":    result.integrity_score,
-        "trusted_source":     result.trusted_source,
-        "flags":              result.flags,
-        "recommended_action": result.recommended_action,
-        "sbom_hash":          result.sbom_hash[:24] + "...",
-    }
 
 
 @app.get("/", response_class=HTMLResponse)

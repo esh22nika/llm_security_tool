@@ -54,7 +54,12 @@ import httpx
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from sentinel.detector_prompt import scan_prompt
 from sentinel.detector_dataset import scan_dataset_record, scan_dataset_batch
-from sentinel.detector_supplychain import verify_model_provenance
+from sentinel.detector_supplychain import (
+    verify_model_provenance,
+    scan_lora_adapter_manifest,
+    scan_tokenizer_config,
+    scan_repo_file_manifest,
+)
 from sentinel.policy_engine import PolicyEngine, PolicyConfig
 from sentinel.middleware import secure_llm_pipeline
 from sentinel.logger import sentinel_logger as log
@@ -639,6 +644,77 @@ async def verify_model(model_name: str = "meta-llama/Llama-3-8b-hf"):
         "flags":              result.flags,
         "recommended_action": result.recommended_action,
         "sbom_hash":          result.sbom_hash[:24] + "...",
+    }
+
+
+@app.post("/api/probe-adapter")
+async def probe_adapter(body: dict):
+    """
+    Advanced supply-chain manifest scanner.
+
+    Accepts any combination of:
+      - adapter_manifest  → LoRA rank / module coverage / provenance / signature heuristics
+      - tokenizer_config  → injected adversarial special-token detection
+      - file_manifest     → repo file listing risk flags (trust_remote_code, custom .py, pickle)
+
+    Returns a unified verdict with per-scanner flags, an integrity score with
+    a per-signal deduction breakdown, and an educational explanation.
+    """
+    from dataclasses import asdict as _asdict
+
+    adapter_manifest  = body.get("adapter_manifest", {})
+    tokenizer_config  = body.get("tokenizer_config", {})
+    file_manifest     = body.get("file_manifest", {})
+
+    adapter_result   = scan_lora_adapter_manifest(adapter_manifest) if adapter_manifest else None
+    tokenizer_flags  = scan_tokenizer_config(tokenizer_config)
+    file_flags       = scan_repo_file_manifest(file_manifest)
+
+    all_flags = []
+    if adapter_result:
+        all_flags.extend(adapter_result.flags)
+    all_flags.extend(tokenizer_flags)
+    all_flags.extend(file_flags)
+
+    # Determine severity-mapped verdict
+    adapter_risk  = adapter_result.risk_level if adapter_result else "LOW"
+    risk_rank     = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    flag_count    = len(all_flags)
+    is_critical   = (
+        adapter_risk == "CRITICAL"
+        or flag_count >= 4
+        or any("trust_remote_code" in f for f in file_flags)
+    )
+    is_high       = not is_critical and (adapter_risk == "HIGH" or flag_count >= 2)
+    combined_risk = "CRITICAL" if is_critical else "HIGH" if is_high else "MEDIUM" if flag_count else "LOW"
+    combined_verdict = "BLOCK" if combined_risk in ("CRITICAL", "HIGH") else "REVIEW"
+
+    # Integrity score: average of adapter score (if present) and file/tokenizer penalties
+    token_penalty = min(1.0, len(tokenizer_flags) * 0.35)
+    file_penalty  = min(1.0, len(file_flags) * 0.20)
+    if adapter_result:
+        integrity = round(adapter_result.integrity_score * (1.0 - token_penalty) * (1.0 - file_penalty), 3)
+    else:
+        integrity = round(max(0.0, 1.0 - token_penalty - file_penalty), 3)
+
+    explanation = (
+        "This artifact would be BLOCKED before loading. One or more critical supply-chain "
+        "integrity signals were violated."
+        if combined_verdict == "BLOCK" else
+        "This artifact requires manual review by a trusted team member before deployment."
+    )
+
+    return {
+        "adapter_scan":       _asdict(adapter_result) if adapter_result else None,
+        "tokenizer_flags":    tokenizer_flags,
+        "file_flags":         file_flags,
+        "all_flags":          all_flags,
+        "combined_risk":      combined_risk,
+        "combined_verdict":   combined_verdict,
+        "integrity_score":    integrity,
+        "integrity_breakdown": adapter_result.integrity_breakdown if adapter_result else {},
+        "total_flags":        flag_count,
+        "explanation":        explanation,
     }
 
 
