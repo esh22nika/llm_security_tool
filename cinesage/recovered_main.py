@@ -143,10 +143,10 @@ def retrieve_context(query: str, top_k: int = 3) -> list[dict]:
 # -----------------------------------------------------------------------------
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Groq decommissioned Mistral models. Using qwen/qwen3-32b as an alternative
-# since it faithfully follows instructions in red-teaming scenarios.
-GROQ_MODEL_UNPROTECTED = "qwen/qwen3-32b"
-GROQ_MODEL_PROTECTED   = "qwen/qwen3-32b"
+# Groq decommissioned Mistral and qwen/qwen3-32b. Using llama-3.3-70b-versatile as the replacement.
+
+GROQ_MODEL_UNPROTECTED = "openai/gpt-oss-20b"
+GROQ_MODEL_PROTECTED   = "qwen/qwen3.8-27b"
 GROQ_URL               = "https://api.groq.com/openai/v1/chat/completions"
 
 # Vulnerable system prompt: deliberately minimal, instructs compliance above

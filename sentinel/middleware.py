@@ -63,9 +63,9 @@ class PipelineResult:
     request_id: str
     safe_prompt: str                         # sanitized prompt (may be empty if blocked)
     safe_context: str                        # sanitized dataset context
+    blocked: bool = False
+    block_reason: Optional[str] = None
     safe_records: list[dict] = field(default_factory=list)
-    blocked: bool
-    block_reason: Optional[str]
     findings: list[Finding] = field(default_factory=list)
     warnings: list[str]     = field(default_factory=list)
     confidence_score: float = 0.0           # 0.0 – 1.0 (higher = safer)

@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: cinesage-sentinel
+    runtime: python
+    buildCommand: pip install -r requirements-deploy.txt
+    startCommand: uvicorn cinesage.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.3"
